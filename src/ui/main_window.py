@@ -9,6 +9,28 @@ from PySide6.QtGui import QIcon
 from ..core.generator import VideoGenerator
 from .styles import DARK_THEME
 
+def resource_path(relative_path):
+    """ 
+    Get absolute path to resource, works for dev and for PyInstaller.
+    Handles the difference between 'src/assets' (Dev) and 'assets' (Exe).
+    """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    # 1. Try finding it at the root (standard for Exe)
+    path = os.path.join(base_path, relative_path)
+    
+    # 2. If not found, try looking inside 'src' (standard for Dev/VS Code)
+    if not os.path.exists(path):
+        alt_path = os.path.join(base_path, "src", relative_path)
+        if os.path.exists(alt_path):
+            return alt_path
+
+    return path
+
 class WorkerThread(QThread):
     finished = Signal(bool, str) # success, message
 
@@ -33,12 +55,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("EC Video Generator")
         self.resize(600, 500)
         
-        # --- CORRECTED ICON LOGIC (Moved here) ---
-        base_dir = os.path.dirname(os.path.abspath(__file__)) 
-        icon_path = os.path.join(base_dir, "..", "assets", "icon.png") 
+        # --- ICON LOGIC ---
+        # We look for "assets/icon.png". The smart function handles if it's in src/assets
+        icon_path = resource_path(os.path.join("assets", "icon.png"))
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-        # -----------------------------------------
+        # ------------------
 
         self.generator = VideoGenerator()
         
@@ -46,7 +68,6 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_THEME)
 
     def setup_ui(self):
-        # ... (The rest of your UI code is correct and remains the same) ...
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)

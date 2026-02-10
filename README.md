@@ -1,0 +1,1 @@
+uv run pyinstaller --noconsole --name "EC_Video_Generator" --icon="src/assets/icon.png" --add-data "src/assets;assets" src/main.py
