@@ -100,24 +100,29 @@ class WorkerThread(QThread):
         input_path = self.kwargs['img'] 
         output_path = self.kwargs['output']
         prompt = self.kwargs['prompt']
-        # Read the slider value (default 1.5)
         img_scale = self.kwargs.get('image_guidance_scale', 1.5)
+        # Get Reference Path
+        ref_path = self.kwargs.get('reference_path', None)
         
         is_video = input_path.lower().endswith(('.mp4', '.avi', '.mov'))
         ai_engine = self._load_ai_engine()
         self.log_update.emit("AI Model Loaded.")
 
         if is_video:
-            # VIDEO MODE
+            # VIDEO MODE (Ref Image support added but will be static on every frame)
             temp_dir = os.path.join(os.path.dirname(output_path), "temp_frames_ai")
             self.log_update.emit("Extracting video frames...")
             frames = self.generator.extract_frames(input_path, temp_dir)
             total_frames = len(frames)
-            self.log_update.emit(f"Processing {total_frames} frames...")
             
             for i, frame_path in enumerate(frames):
                 self.log_update.emit(f"AI Edit: Frame {i+1}/{total_frames}")
-                ai_engine.edit_image(frame_path, prompt, frame_path, steps=10, image_guidance_scale=img_scale)
+                ai_engine.edit_image(
+                    frame_path, prompt, frame_path, 
+                    steps=10, 
+                    image_guidance_scale=img_scale,
+                    reference_path=ref_path # Pass ref here
+                )
                 progress = int(((i + 1) / total_frames) * 100)
                 self.progress_update.emit(progress)
             
@@ -132,7 +137,12 @@ class WorkerThread(QThread):
                 self.progress_update.emit(progress)
                 self.log_update.emit(f"AI Processing: Step {step + 1}/{total_steps}")
 
-            ai_engine.edit_image(input_path, prompt, output_path, image_guidance_scale=img_scale, status_callback=callback)
+            ai_engine.edit_image(
+                input_path, prompt, output_path, 
+                image_guidance_scale=img_scale, 
+                reference_path=ref_path, # Pass ref here
+                status_callback=callback
+            )
 
 
 class MainWindow(QMainWindow):
@@ -154,6 +164,7 @@ class MainWindow(QMainWindow):
         self.concat_img2 = None
         self.ai_input_path = None
         self.ai_output_path = None
+        self.ai_reference_path = None # New Variable
 
         self.setup_ui()
         self.setStyleSheet(DARK_THEME)
@@ -274,13 +285,20 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.lbl_ai_preview_before); splitter.addWidget(self.lbl_ai_preview_after)
         layout.addWidget(splitter)
 
-        # 3. Controls (Prompt + Slider)
+        # 3. Controls (Prompt + Slider + Reference)
         control_group = QGroupBox("2. Settings")
         cg_layout = QVBoxLayout()
         
+        # Reference Image Button
+        ref_layout = QHBoxLayout()
+        self.btn_ref_image = QPushButton("➕ Add Reference Image (Optional)")
+        self.btn_ref_image.clicked.connect(self.select_reference_image)
+        ref_layout.addWidget(self.btn_ref_image)
+        cg_layout.addLayout(ref_layout)
+
         # Prompt
         self.txt_prompt = QLineEdit()
-        self.txt_prompt.setPlaceholderText("e.g., 'make the jacket red'")
+        self.txt_prompt.setPlaceholderText("e.g., 'make the added object blend in', 'make it look real'")
         cg_layout.addWidget(QLabel("Instruction:"))
         cg_layout.addWidget(self.txt_prompt)
         
@@ -295,7 +313,6 @@ class MainWindow(QMainWindow):
         slider_layout.addWidget(self.slider_fidelity)
         slider_layout.addWidget(QLabel("Strict"))
         
-        # Value Label
         self.lbl_fidelity_val = QLabel("1.5")
         self.lbl_fidelity_val.setFixedWidth(30)
         self.lbl_fidelity_val.setStyleSheet("font-weight: bold; color: #00ff00;")
@@ -345,6 +362,13 @@ class MainWindow(QMainWindow):
                 pixmap = QPixmap(path).scaled(self.lbl_ai_preview_before.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self.lbl_ai_preview_before.setPixmap(pixmap)
 
+    def select_reference_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Reference Object", "", "Images (*.png *.jpg *.jpeg)")
+        if path:
+            self.ai_reference_path = path
+            self.btn_ref_image.setText(f"➕ Ref: {os.path.basename(path)}")
+            self.btn_ref_image.setStyleSheet("color: #00ff00; border: 1px solid #00ff00;")
+
     # --- RUNNERS ---
     def run_create_video(self): self.start_worker('create_video', img=self.image_path, audio=self.audio_path, output=self._save("Video (*.mp4)"), quality=self.combo_quality_video.currentText())
     def run_upscale_video(self): self.start_worker('upscale_video', video=self.video_input_path, output=self._save("Video (*.mp4)"), quality=self.combo_quality_upscale.currentText())
@@ -357,7 +381,6 @@ class MainWindow(QMainWindow):
         if not self.ai_input_path or not self.txt_prompt.text():
             QMessageBox.warning(self, "Error", "Missing Input or Prompt"); return
         
-        # Get Slider Value
         fidelity = self.slider_fidelity.value() / 10.0
         
         is_video = self.ai_input_path.lower().endswith(('.mp4', '.avi'))
@@ -370,7 +393,8 @@ class MainWindow(QMainWindow):
                               img=self.ai_input_path, 
                               prompt=self.txt_prompt.text(), 
                               output=save_path,
-                              image_guidance_scale=fidelity) # Pass the slider value
+                              image_guidance_scale=fidelity,
+                              reference_path=self.ai_reference_path) # Pass ref path
 
     def _save(self, filter_str):
         path, _ = QFileDialog.getSaveFileName(self, "Save File", "", filter_str)

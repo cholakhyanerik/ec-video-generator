@@ -64,15 +64,48 @@ class AIImageEditor:
             self.video_pipe.enable_model_cpu_offload() 
             self.video_pipe.unet.enable_forward_chunking()
 
-    def edit_image(self, image_path, prompt, output_path, steps=20, image_guidance_scale=1.5, status_callback=None):
+    def _overlay_image(self, bg_image, ref_path):
+        """ Pastes the reference image onto the background for the AI to fix """
+        if not ref_path or not os.path.exists(ref_path):
+            return bg_image
+            
+        try:
+            fg_image = Image.open(ref_path).convert("RGBA")
+            bg_image = bg_image.convert("RGBA")
+            
+            # Resize foreground to be roughly 50% of background size
+            bg_w, bg_h = bg_image.size
+            target_w = bg_w // 2
+            ratio = target_w / fg_image.width
+            target_h = int(fg_image.height * ratio)
+            
+            fg_image = fg_image.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            
+            # Center it
+            offset_x = (bg_w - target_w) // 2
+            offset_y = (bg_h - target_h) // 2
+            
+            # Paste
+            bg_image.alpha_composite(fg_image, (offset_x, offset_y))
+            return bg_image.convert("RGB")
+        except Exception as e:
+            print(f"Overlay Error: {e}")
+            return bg_image.convert("RGB")
+
+    def edit_image(self, image_path, prompt, output_path, steps=20, image_guidance_scale=1.5, reference_path=None, status_callback=None):
         """ 
         Runs the Image Edit.
-        - image_guidance_scale: 1.0 (Creative) to 3.0 (Strict Fidelity). Default 1.5.
+        - reference_path: Optional path to an image to 'add' to the scene.
         """
         self._load_edit_model()
              
         input_image = Image.open(image_path)
         input_image = ImageOps.exif_transpose(input_image).convert("RGB")
+        
+        # --- NEW: APPLY REFERENCE OVERLAY ---
+        if reference_path:
+            print(f"Applying Reference Image: {reference_path}")
+            input_image = self._overlay_image(input_image, reference_path)
         
         max_dim = 768
         if max(input_image.size) > max_dim:
@@ -85,7 +118,7 @@ class AIImageEditor:
             res = self.edit_pipe(
                 prompt, image=input_image, num_inference_steps=steps, 
                 guidance_scale=7.5, 
-                image_guidance_scale=image_guidance_scale, # Controlled by slider
+                image_guidance_scale=image_guidance_scale, 
                 callback=pipe_callback, callback_steps=1 
             ).images[0]
 
