@@ -1,5 +1,6 @@
 import subprocess
 import os
+import shutil
 from PIL import Image
 from .gpu_utils import get_best_encoder
 
@@ -48,9 +49,8 @@ class VideoGenerator:
         ]
         self._run_ffmpeg(cmd)
 
-    # --- IMAGE FUNCTIONS (NEW) ---
+    # --- IMAGE FUNCTIONS ---
     def upscale_image_batch(self, image_paths, output_folder, quality_preset):
-        """ Resizes a list of images to the target resolution using High-Quality Lanczos """
         target_w, target_h = self._get_resolution(quality_preset)
         
         for img_path in image_paths:
@@ -59,38 +59,90 @@ class VideoGenerator:
             save_path = os.path.join(output_folder, f"{name}_{quality_preset}{ext}")
 
             with Image.open(img_path) as img:
-                # Calculate new size maintaining aspect ratio
                 img.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
-                
-                # Create a blank background (black) to center the image if aspect ratio differs
-                # Or just save the resized image directly. Here we save directly to keep it clean.
-                # If you want forced 16:9 padding like video, let me know. 
-                # For now, standard resize is usually what people want for images.
                 img.save(save_path, quality=95)
 
     def concat_images(self, img1_path, img2_path, output_path):
-        """ Stitches two images side-by-side """
         img1 = Image.open(img1_path)
         img2 = Image.open(img2_path)
 
-        # Resize img2 to match img1's height for a clean stitch
-        # Ratio = img1_h / img2_h
         if img1.height != img2.height:
             ratio = img1.height / img2.height
             new_w = int(img2.width * ratio)
             img2 = img2.resize((new_w, img1.height), Image.Resampling.LANCZOS)
 
-        # Create new canvas
         total_width = img1.width + img2.width
-        max_height = img1.height # They match now
+        max_height = img1.height 
 
         new_img = Image.new('RGB', (total_width, max_height))
         new_img.paste(img1, (0, 0))
         new_img.paste(img2, (img1.width, 0))
-
         new_img.save(output_path, quality=95)
 
-    # --- HELPERS ---
+    # --- AI VIDEO HELPERS ---
+    def extract_frames(self, video_path, output_folder):
+        """ Extracts all frames from a video into a folder """
+        if os.path.exists(output_folder):
+            shutil.rmtree(output_folder)
+        os.makedirs(output_folder)
+            
+        print(f"Extracting frames from {video_path}...")
+        
+        # Extract at 30fps
+        cmd = [
+            'ffmpeg', '-i', video_path, 
+            '-vf', 'fps=30', 
+            os.path.join(output_folder, 'frame_%04d.png')
+        ]
+        self._run_ffmpeg(cmd)
+        
+        # Return sorted list of frames
+        return sorted([
+            os.path.join(output_folder, f) 
+            for f in os.listdir(output_folder) 
+            if f.endswith('.png')
+        ])
+
+    def frames_to_video(self, frames_folder, audio_source_video, output_path):
+        """ Stitches frames back into a video """
+        print(f"Stitching video to {output_path}...")
+        
+        has_audio = self.has_audio_stream(audio_source_video)
+        
+        # Start command with input frames
+        cmd = [
+            'ffmpeg', '-y',
+            '-framerate', '30', 
+            '-i', os.path.join(frames_folder, 'frame_%04d.png'),
+        ]
+        
+        # Add audio map if exists
+        if has_audio:
+            cmd.extend(['-i', audio_source_video, '-map', '0:v', '-map', '1:a', '-c:a', 'copy'])
+            
+        cmd.extend([
+            '-c:v', self.encoder, 
+            '-pix_fmt', 'yuv420p', 
+            output_path
+        ])
+        
+        self._run_ffmpeg(cmd)
+
+    def has_audio_stream(self, video_path):
+        try:
+            cmd = [
+                'ffprobe', '-v', 'error', 
+                '-select_streams', 'a', 
+                '-show_entries', 'stream=codec_name', 
+                '-of', 'default=noprint_wrappers=1:nokey=1', 
+                video_path
+            ]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            return len(result.stdout.strip()) > 0
+        except:
+            return False
+
+    # --- CORE HELPERS ---
     def _run_ffmpeg(self, cmd):
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         stdout, stderr = process.communicate()

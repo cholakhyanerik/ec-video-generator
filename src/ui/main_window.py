@@ -1,6 +1,6 @@
 import sys
 import os
-import time
+import shutil
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLabel, QPushButton, QFileDialog, 
                                QComboBox, QProgressBar, QMessageBox, QGroupBox, 
@@ -9,7 +9,10 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QIcon, QPixmap
 
 from ..core.generator import VideoGenerator
+
+# Lazy load placeholder
 AIImageEditor = None 
+
 from .styles import DARK_THEME
 
 def resource_path(relative_path):
@@ -26,8 +29,8 @@ def resource_path(relative_path):
 
 class WorkerThread(QThread):
     finished = Signal(bool, str)
-    progress_update = Signal(int)       # 0 to 100
-    log_update = Signal(str)            # Text for the console
+    progress_update = Signal(int)       
+    log_update = Signal(str)            
 
     def __init__(self, mode, **kwargs):
         super().__init__()
@@ -44,7 +47,7 @@ class WorkerThread(QThread):
             
             elif self.mode == 'create_video':
                 self.log_update.emit("Generating video from image + audio...")
-                self.progress_update.emit(10) # Fake start progress
+                self.progress_update.emit(10) 
                 self.generator.generate_video(self.kwargs['img'], self.kwargs['audio'], self.kwargs['output'], self.kwargs['quality'])
                 self.progress_update.emit(100)
 
@@ -55,13 +58,10 @@ class WorkerThread(QThread):
                 self.progress_update.emit(100)
 
             elif self.mode == 'upscale_images':
-                self.log_update.emit(f"Processing batch of {len(self.kwargs['images'])} images...")
-                # We can do progress here easily
                 total = len(self.kwargs['images'])
+                self.log_update.emit(f"Processing batch of {total} images...")
                 for i, img_path in enumerate(self.kwargs['images']):
                     self.log_update.emit(f"Upscaling: {os.path.basename(img_path)}")
-                    # We need to expose a single-image upscale function in generator to do this loop correctly
-                    # For now, we call the batch function which does it all at once.
                     self.generator.upscale_image_batch([img_path], self.kwargs['output_folder'], self.kwargs['quality'])
                     progress = int(((i + 1) / total) * 100)
                     self.progress_update.emit(progress)
@@ -82,6 +82,13 @@ class WorkerThread(QThread):
             self.finished.emit(False, f"Error: {e}")
 
     def run_ai_edit(self):
+        input_path = self.kwargs['img'] 
+        output_path = self.kwargs['output']
+        prompt = self.kwargs['prompt']
+        
+        # Check if input is video or image
+        is_video = input_path.lower().endswith(('.mp4', '.avi', '.mov'))
+        
         self.log_update.emit("Initializing AI Engine... (Check terminal if downloading models)")
         global AIImageEditor
         if AIImageEditor is None:
@@ -89,15 +96,47 @@ class WorkerThread(QThread):
                 AIImageEditor = AIEngine
         
         ai_engine = AIImageEditor()
-        self.log_update.emit("AI Model Loaded. Starting inference...")
-        
-        # Callback to update UI from inside the AI loop
-        def callback(step, total_steps):
-            progress = int(((step + 1) / total_steps) * 100)
-            self.progress_update.emit(progress)
-            self.log_update.emit(f"AI Processing: Step {step + 1}/{total_steps}")
+        self.log_update.emit("AI Model Loaded.")
 
-        ai_engine.edit_image(self.kwargs['img'], self.kwargs['prompt'], self.kwargs['output'], status_callback=callback)
+        if is_video:
+            # VIDEO MODE
+            temp_dir = os.path.join(os.path.dirname(output_path), "temp_frames_ai")
+            
+            # 1. Extract Frames
+            self.log_update.emit("Extracting video frames...")
+            frames = self.generator.extract_frames(input_path, temp_dir)
+            total_frames = len(frames)
+            
+            self.log_update.emit(f"Processing {total_frames} frames. This will take time!")
+            
+            # 2. Process Each Frame
+            for i, frame_path in enumerate(frames):
+                self.log_update.emit(f"AI Edit: Frame {i+1}/{total_frames}")
+                
+                # We overwrite the frame with the edited version
+                # Reduced steps to 10 for video speed, guidance 7.5
+                ai_engine.edit_image(frame_path, prompt, frame_path, steps=10)
+                
+                # Update progress
+                progress = int(((i + 1) / total_frames) * 100)
+                self.progress_update.emit(progress)
+            
+            # 3. Stitch back
+            self.log_update.emit("Reassembling video...")
+            self.generator.frames_to_video(temp_dir, input_path, output_path)
+            
+            # 4. Cleanup
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            
+        else:
+            # IMAGE MODE
+            def callback(step, total_steps):
+                progress = int(((step + 1) / total_steps) * 100)
+                self.progress_update.emit(progress)
+                self.log_update.emit(f"AI Processing: Step {step + 1}/{total_steps}")
+
+            ai_engine.edit_image(input_path, prompt, output_path, status_callback=callback)
 
 
 class MainWindow(QMainWindow):
@@ -162,7 +201,7 @@ class MainWindow(QMainWindow):
         progress_group.setLayout(pg_layout)
         main_layout.addWidget(progress_group)
 
-    # --- TAB SETUP FUNCTIONS (Identical to before, kept brief for clarity) ---
+    # --- TAB SETUP FUNCTIONS ---
     def setup_create_tab(self):
         layout = QVBoxLayout(self.tab_create)
         self.lbl_image = QLabel("No Image Selected")
@@ -219,9 +258,9 @@ class MainWindow(QMainWindow):
 
     def setup_ai_tab(self):
         layout = QVBoxLayout(self.tab_ai)
-        input_group = QGroupBox("1. Select Image")
+        input_group = QGroupBox("1. Select Image or Video")
         ig_layout = QHBoxLayout()
-        self.btn_ai_input = QPushButton("Select Image to Edit"); self.btn_ai_input.clicked.connect(self.select_ai_input)
+        self.btn_ai_input = QPushButton("Select Image/Video to Edit"); self.btn_ai_input.clicked.connect(self.select_ai_input)
         ig_layout.addWidget(self.btn_ai_input)
         input_group.setLayout(ig_layout)
         layout.addWidget(input_group)
@@ -234,7 +273,7 @@ class MainWindow(QMainWindow):
 
         prompt_group = QGroupBox("2. Describe the edit")
         pg_layout = QVBoxLayout()
-        self.txt_prompt = QLineEdit(); self.txt_prompt.setPlaceholderText("e.g., 'make the jacket red', 'remove the person'")
+        self.txt_prompt = QLineEdit(); self.txt_prompt.setPlaceholderText("e.g., 'make the jacket red', 'make it look like a cartoon'")
         self.txt_prompt.setFixedHeight(40); self.txt_prompt.setStyleSheet("font-size: 14px; padding: 5px;")
         pg_layout.addWidget(self.txt_prompt)
         prompt_group.setLayout(pg_layout)
@@ -264,12 +303,16 @@ class MainWindow(QMainWindow):
             else: self.concat_img2 = path; self.lbl_c2.setText(os.path.basename(path))
 
     def select_ai_input(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg *.jpeg)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Image/Video", "", "Files (*.png *.jpg *.jpeg *.mp4 *.avi)")
         if path:
             self.ai_input_path = path
             self.btn_ai_input.setText(os.path.basename(path))
-            pixmap = QPixmap(path).scaled(self.lbl_ai_preview_before.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.lbl_ai_preview_before.setPixmap(pixmap)
+            
+            if path.lower().endswith(('.mp4', '.avi')):
+                self.lbl_ai_preview_before.setText("🎥 Video Selected\n(No Preview)")
+            else:
+                pixmap = QPixmap(path).scaled(self.lbl_ai_preview_before.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.lbl_ai_preview_before.setPixmap(pixmap)
 
     # --- RUNNERS ---
     def run_create_video(self): self.start_worker('create_video', img=self.image_path, audio=self.audio_path, output=self._save("Video (*.mp4)"), quality=self.combo_quality_video.currentText())
@@ -281,8 +324,13 @@ class MainWindow(QMainWindow):
 
     def run_ai_edit(self):
         if not self.ai_input_path or not self.txt_prompt.text():
-            QMessageBox.warning(self, "Error", "Missing Image or Prompt"); return
-        save_path = self._save("Image (*.png)")
+            QMessageBox.warning(self, "Error", "Missing Input or Prompt"); return
+        
+        is_video = self.ai_input_path.lower().endswith(('.mp4', '.avi'))
+        filter_str = "Video (*.mp4)" if is_video else "Image (*.png)"
+        default_name = "ai_result.mp4" if is_video else "ai_result.png"
+        
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save Result", default_name, filter_str)
         if save_path:
             self.ai_output_path = save_path
             self.start_worker('ai_edit', img=self.ai_input_path, prompt=self.txt_prompt.text(), output=save_path)
@@ -314,8 +362,11 @@ class MainWindow(QMainWindow):
             self.progress.setValue(100)
             self.append_log("✅ DONE.")
             if self.tabs.currentIndex() == 3 and hasattr(self, 'ai_output_path') and os.path.exists(self.ai_output_path):
-                 pixmap = QPixmap(self.ai_output_path).scaled(self.lbl_ai_preview_after.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                 self.lbl_ai_preview_after.setPixmap(pixmap)
+                 if self.ai_output_path.endswith('.png'):
+                     pixmap = QPixmap(self.ai_output_path).scaled(self.lbl_ai_preview_after.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                     self.lbl_ai_preview_after.setPixmap(pixmap)
+                 else:
+                     self.lbl_ai_preview_after.setText("✅ Video Saved!")
             QMessageBox.information(self, "Success", message)
         else:
             self.append_log(f"❌ ERROR: {message}")

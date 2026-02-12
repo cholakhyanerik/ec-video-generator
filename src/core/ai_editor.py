@@ -47,15 +47,14 @@ class AIImageEditor:
         input_image = ImageOps.exif_transpose(input_image)
         input_image = input_image.convert("RGB")
 
-        # Resize safety
+        # Resize safety for VRAM
         max_dim = 768
         if max(input_image.size) > max_dim:
              input_image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
 
-        # Define the callback for the AI pipeline
+        # Callback wrapper
         def pipe_callback(step, timestep, latents):
             if status_callback:
-                # step is the current step index
                 status_callback(step, steps)
 
         with torch.autocast(self.device):
@@ -66,7 +65,7 @@ class AIImageEditor:
                 guidance_scale=guidance_scale,
                 image_guidance_scale=image_guidance_scale,
                 callback=pipe_callback,
-                callback_steps=1 # Report every single step
+                callback_steps=1 
             ).images
 
         images[0].save(output_path, quality=95)
