@@ -1,11 +1,26 @@
 [project]
 name = "ec-video-generator"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI Video Generator with GPU Support"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10"
 dependencies = [
-    "pillow>=12.1.1",
-    "pyinstaller>=6.18.0",
-    "pyside6>=6.10.2",
+    "pyside6>=6.8.0",
+    "pillow>=11.0.0",
+    "diffusers>=0.32.0",
+    "transformers>=4.48.0",
+    "accelerate>=1.3.0",
+    "pyinstaller>=6.11.0",
+    "torch",
+    "torchvision",
 ]
+
+# --- FORCE NVIDIA GPU SUPPORT ---
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }

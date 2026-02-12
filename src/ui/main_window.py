@@ -1,12 +1,15 @@
 import sys
 import os
+import time
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLabel, QPushButton, QFileDialog, 
-                               QComboBox, QProgressBar, QMessageBox, QGroupBox, QTabWidget, QStackedWidget)
+                               QComboBox, QProgressBar, QMessageBox, QGroupBox, 
+                               QTabWidget, QStackedWidget, QLineEdit, QTextEdit, QSplitter)
 from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QPixmap
 
 from ..core.generator import VideoGenerator
+AIImageEditor = None 
 from .styles import DARK_THEME
 
 def resource_path(relative_path):
@@ -23,40 +26,90 @@ def resource_path(relative_path):
 
 class WorkerThread(QThread):
     finished = Signal(bool, str)
+    progress_update = Signal(int)       # 0 to 100
+    log_update = Signal(str)            # Text for the console
 
-    def __init__(self, mode, generator, **kwargs):
+    def __init__(self, mode, **kwargs):
         super().__init__()
         self.mode = mode
-        self.generator = generator
         self.kwargs = kwargs
+        self.generator = VideoGenerator()
 
     def run(self):
         try:
-            if self.mode == 'create_video':
-                self.generator.generate_video(self.kwargs['img'], self.kwargs['audio'], self.kwargs['output'], self.kwargs['quality'])
-            elif self.mode == 'upscale_video':
-                self.generator.upscale_video(self.kwargs['video'], self.kwargs['output'], self.kwargs['quality'])
-            elif self.mode == 'upscale_images':
-                self.generator.upscale_image_batch(self.kwargs['images'], self.kwargs['output_folder'], self.kwargs['quality'])
-            elif self.mode == 'concat_images':
-                self.generator.concat_images(self.kwargs['img1'], self.kwargs['img2'], self.kwargs['output'])
+            self.log_update.emit(f"--- Starting Task: {self.mode} ---")
             
+            if self.mode == 'ai_edit':
+                self.run_ai_edit()
+            
+            elif self.mode == 'create_video':
+                self.log_update.emit("Generating video from image + audio...")
+                self.progress_update.emit(10) # Fake start progress
+                self.generator.generate_video(self.kwargs['img'], self.kwargs['audio'], self.kwargs['output'], self.kwargs['quality'])
+                self.progress_update.emit(100)
+
+            elif self.mode == 'upscale_video':
+                self.log_update.emit("Upscaling video (this may take time)...")
+                self.progress_update.emit(10)
+                self.generator.upscale_video(self.kwargs['video'], self.kwargs['output'], self.kwargs['quality'])
+                self.progress_update.emit(100)
+
+            elif self.mode == 'upscale_images':
+                self.log_update.emit(f"Processing batch of {len(self.kwargs['images'])} images...")
+                # We can do progress here easily
+                total = len(self.kwargs['images'])
+                for i, img_path in enumerate(self.kwargs['images']):
+                    self.log_update.emit(f"Upscaling: {os.path.basename(img_path)}")
+                    # We need to expose a single-image upscale function in generator to do this loop correctly
+                    # For now, we call the batch function which does it all at once.
+                    self.generator.upscale_image_batch([img_path], self.kwargs['output_folder'], self.kwargs['quality'])
+                    progress = int(((i + 1) / total) * 100)
+                    self.progress_update.emit(progress)
+            
+            elif self.mode == 'concat_images':
+                self.log_update.emit("Merging images...")
+                self.generator.concat_images(self.kwargs['img1'], self.kwargs['img2'], self.kwargs['output'])
+                self.progress_update.emit(100)
+            
+            self.log_update.emit("--- Task Finished Successfully ---")
             self.finished.emit(True, "Task completed successfully!")
+
+        except ImportError as e:
+             self.log_update.emit(f"CRITICAL ERROR: Missing Libraries. {str(e)}")
+             self.finished.emit(False, f"Missing AI Libraries: {e}")
         except Exception as e:
-            self.finished.emit(False, str(e))
+            self.log_update.emit(f"ERROR: {str(e)}")
+            self.finished.emit(False, f"Error: {e}")
+
+    def run_ai_edit(self):
+        self.log_update.emit("Initializing AI Engine... (Check terminal if downloading models)")
+        global AIImageEditor
+        if AIImageEditor is None:
+                from ..core.ai_editor import AIImageEditor as AIEngine
+                AIImageEditor = AIEngine
+        
+        ai_engine = AIImageEditor()
+        self.log_update.emit("AI Model Loaded. Starting inference...")
+        
+        # Callback to update UI from inside the AI loop
+        def callback(step, total_steps):
+            progress = int(((step + 1) / total_steps) * 100)
+            self.progress_update.emit(progress)
+            self.log_update.emit(f"AI Processing: Step {step + 1}/{total_steps}")
+
+        ai_engine.edit_image(self.kwargs['img'], self.kwargs['prompt'], self.kwargs['output'], status_callback=callback)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EC Video Generator")
-        self.resize(650, 600)
+        self.setWindowTitle("EC Video Generator Studio")
+        self.resize(900, 750) 
         
         icon_path = resource_path(os.path.join("assets", "icon.png"))
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        self.generator = VideoGenerator()
-        
         # UI State Variables
         self.image_path = None
         self.audio_path = None
@@ -64,6 +117,7 @@ class MainWindow(QMainWindow):
         self.img_batch_paths = []
         self.concat_img1 = None
         self.concat_img2 = None
+        self.ai_input_path = None
 
         self.setup_ui()
         self.setStyleSheet(DARK_THEME)
@@ -72,237 +126,197 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(15)
+        main_layout.setSpacing(10)
 
         # Header
-        header = QLabel("Video Generator Studio")
+        header = QLabel("Video & AI Studio")
         header.setObjectName("Header")
         header.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(header)
 
         # --- TABS ---
         self.tabs = QTabWidget()
-        
-        # Tab 1: Create Video
-        self.tab_create = QWidget()
-        self.setup_create_tab()
-        self.tabs.addTab(self.tab_create, "Create Video")
-
-        # Tab 2: Upscale Video
-        self.tab_upscale = QWidget()
-        self.setup_upscale_tab()
-        self.tabs.addTab(self.tab_upscale, "Upscale Video")
-
-        # Tab 3: Image Tools
-        self.tab_images = QWidget()
-        self.setup_image_tools_tab()
-        self.tabs.addTab(self.tab_images, "Image Tools")
-
+        self.tab_create = QWidget(); self.setup_create_tab(); self.tabs.addTab(self.tab_create, "Create Video")
+        self.tab_upscale = QWidget(); self.setup_upscale_tab(); self.tabs.addTab(self.tab_upscale, "Upscale Video")
+        self.tab_images = QWidget(); self.setup_image_tools_tab(); self.tabs.addTab(self.tab_images, "Image Tools")
+        self.tab_ai = QWidget(); self.setup_ai_tab(); self.tabs.addTab(self.tab_ai, "✨ AI Editor")
         main_layout.addWidget(self.tabs)
 
-        # --- GLOBAL SETTINGS & RUN ---
-        # We put the "Run" button inside each tab logic or keep a global one?
-        # A global button is tricky because the inputs change.
-        # Let's put specific Run buttons inside the tabs for clarity, 
-        # OR keep the global one and read the current tab index.
-        # Global is cleaner for code, but let's add the Global Progress Bar here.
-        
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-        self.progress.setTextVisible(False)
-        main_layout.addWidget(self.progress)
+        # --- PROGRESS & LOGS ---
+        progress_group = QGroupBox("Status & Logs")
+        pg_layout = QVBoxLayout()
 
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setStyleSheet("text-align: center; color: black; font-weight: bold;")
+        pg_layout.addWidget(self.progress)
+
+        self.log_console = QTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setFixedHeight(120)
+        self.log_console.setStyleSheet("background-color: #111; color: #00ff00; font-family: Consolas; font-size: 12px;")
+        self.log_console.setPlaceholderText("System logs will appear here...")
+        pg_layout.addWidget(self.log_console)
+
+        progress_group.setLayout(pg_layout)
+        main_layout.addWidget(progress_group)
+
+    # --- TAB SETUP FUNCTIONS (Identical to before, kept brief for clarity) ---
     def setup_create_tab(self):
         layout = QVBoxLayout(self.tab_create)
-        
-        # Inputs
         self.lbl_image = QLabel("No Image Selected")
-        btn_image = QPushButton("Select Image")
-        btn_image.clicked.connect(self.select_image)
-        layout.addWidget(btn_image)
-        layout.addWidget(self.lbl_image)
-
+        btn_image = QPushButton("Select Image"); btn_image.clicked.connect(self.select_image)
+        layout.addWidget(btn_image); layout.addWidget(self.lbl_image)
         self.lbl_audio = QLabel("No Audio Selected")
-        btn_audio = QPushButton("Select Audio (MP3)")
-        btn_audio.clicked.connect(self.select_audio)
-        layout.addWidget(btn_audio)
-        layout.addWidget(self.lbl_audio)
-
-        # Quality
+        btn_audio = QPushButton("Select Audio (MP3)"); btn_audio.clicked.connect(self.select_audio)
+        layout.addWidget(btn_audio); layout.addWidget(self.lbl_audio)
         layout.addWidget(QLabel("Target Quality:"))
-        self.combo_quality_video = QComboBox()
-        self.combo_quality_video.addItems(["1080p", "4k", "2k", "720p"])
+        self.combo_quality_video = QComboBox(); self.combo_quality_video.addItems(["1080p", "4k", "2k", "720p"])
         layout.addWidget(self.combo_quality_video)
-
-        # Run Button
-        btn_run = QPushButton("Generate Video")
-        btn_run.setFixedHeight(40)
-        btn_run.clicked.connect(self.run_create_video)
-        layout.addWidget(btn_run)
-        layout.addStretch()
+        btn_run = QPushButton("Generate Video"); btn_run.setFixedHeight(40); btn_run.clicked.connect(self.run_create_video)
+        layout.addWidget(btn_run); layout.addStretch()
 
     def setup_upscale_tab(self):
         layout = QVBoxLayout(self.tab_upscale)
-        
         self.lbl_video = QLabel("No Video Selected")
-        btn_video = QPushButton("Select Video File")
-        btn_video.clicked.connect(self.select_video_input)
-        layout.addWidget(btn_video)
-        layout.addWidget(self.lbl_video)
-
+        btn_video = QPushButton("Select Video File"); btn_video.clicked.connect(self.select_video_input)
+        layout.addWidget(btn_video); layout.addWidget(self.lbl_video)
         layout.addWidget(QLabel("Target Quality:"))
-        self.combo_quality_upscale = QComboBox()
-        self.combo_quality_upscale.addItems(["1080p", "4k", "2k", "720p"])
+        self.combo_quality_upscale = QComboBox(); self.combo_quality_upscale.addItems(["1080p", "4k", "2k", "720p"])
         layout.addWidget(self.combo_quality_upscale)
-
-        btn_run = QPushButton("Upscale Video")
-        btn_run.setFixedHeight(40)
-        btn_run.clicked.connect(self.run_upscale_video)
-        layout.addWidget(btn_run)
-        layout.addStretch()
+        btn_run = QPushButton("Upscale Video"); btn_run.setFixedHeight(40); btn_run.clicked.connect(self.run_upscale_video)
+        layout.addWidget(btn_run); layout.addStretch()
 
     def setup_image_tools_tab(self):
         layout = QVBoxLayout(self.tab_images)
-        
-        # Mode Selection
         layout.addWidget(QLabel("Select Tool:"))
-        self.combo_img_mode = QComboBox()
-        self.combo_img_mode.addItems(["Upscale Images (Batch)", "Concat 2 Images (Side-by-Side)"])
+        self.combo_img_mode = QComboBox(); self.combo_img_mode.addItems(["Upscale Images (Batch)", "Concat 2 Images"])
         self.combo_img_mode.currentIndexChanged.connect(self.switch_image_mode)
         layout.addWidget(self.combo_img_mode)
-
-        # Stacked Widget to flip between modes
         self.stack_img = QStackedWidget()
         
-        # --- Page 1: Upscale ---
-        page_upscale = QWidget()
-        p1_layout = QVBoxLayout(page_upscale)
+        p1 = QWidget(); p1_layout = QVBoxLayout(p1)
         self.lbl_batch = QLabel("No Images Selected")
-        btn_batch = QPushButton("Select Images (Select Multiple)")
-        btn_batch.clicked.connect(self.select_batch_images)
-        p1_layout.addWidget(btn_batch)
-        p1_layout.addWidget(self.lbl_batch)
-        
+        btn_batch = QPushButton("Select Images"); btn_batch.clicked.connect(self.select_batch_images)
+        p1_layout.addWidget(btn_batch); p1_layout.addWidget(self.lbl_batch)
         p1_layout.addWidget(QLabel("Target Resolution:"))
-        self.combo_quality_img = QComboBox()
-        self.combo_quality_img.addItems(["4k", "2k", "1080p"])
+        self.combo_quality_img = QComboBox(); self.combo_quality_img.addItems(["4k", "2k", "1080p"])
         p1_layout.addWidget(self.combo_quality_img)
-
-        btn_run_img = QPushButton("Upscale Images")
-        btn_run_img.setFixedHeight(40)
-        btn_run_img.clicked.connect(self.run_upscale_images)
-        p1_layout.addWidget(btn_run_img)
-        p1_layout.addStretch()
+        btn_run_img = QPushButton("Upscale Images"); btn_run_img.setFixedHeight(40); btn_run_img.clicked.connect(self.run_upscale_images)
+        p1_layout.addWidget(btn_run_img); p1_layout.addStretch()
         
-        # --- Page 2: Concat ---
-        page_concat = QWidget()
-        p2_layout = QVBoxLayout(page_concat)
-        
-        # Img 1
-        self.lbl_c1 = QLabel("Image 1: None")
-        btn_c1 = QPushButton("Select Left Image")
-        btn_c1.clicked.connect(lambda: self.select_concat_img(1))
-        p2_layout.addWidget(btn_c1)
-        p2_layout.addWidget(self.lbl_c1)
+        p2 = QWidget(); p2_layout = QVBoxLayout(p2)
+        self.lbl_c1 = QLabel("Left: None"); btn_c1 = QPushButton("Select Left"); btn_c1.clicked.connect(lambda: self.select_concat_img(1))
+        p2_layout.addWidget(btn_c1); p2_layout.addWidget(self.lbl_c1)
+        self.lbl_c2 = QLabel("Right: None"); btn_c2 = QPushButton("Select Right"); btn_c2.clicked.connect(lambda: self.select_concat_img(2))
+        p2_layout.addWidget(btn_c2); p2_layout.addWidget(self.lbl_c2)
+        btn_run_cat = QPushButton("Merge Images"); btn_run_cat.setFixedHeight(40); btn_run_cat.clicked.connect(self.run_concat_images)
+        p2_layout.addWidget(btn_run_cat); p2_layout.addStretch()
 
-        # Img 2
-        self.lbl_c2 = QLabel("Image 2: None")
-        btn_c2 = QPushButton("Select Right Image")
-        btn_c2.clicked.connect(lambda: self.select_concat_img(2))
-        p2_layout.addWidget(btn_c2)
-        p2_layout.addWidget(self.lbl_c2)
-
-        btn_run_cat = QPushButton("Merge Images")
-        btn_run_cat.setFixedHeight(40)
-        btn_run_cat.clicked.connect(self.run_concat_images)
-        p2_layout.addWidget(btn_run_cat)
-        p2_layout.addStretch()
-
-        self.stack_img.addWidget(page_upscale)
-        self.stack_img.addWidget(page_concat)
+        self.stack_img.addWidget(p1); self.stack_img.addWidget(p2)
         layout.addWidget(self.stack_img)
 
-    def switch_image_mode(self, index):
-        self.stack_img.setCurrentIndex(index)
+    def setup_ai_tab(self):
+        layout = QVBoxLayout(self.tab_ai)
+        input_group = QGroupBox("1. Select Image")
+        ig_layout = QHBoxLayout()
+        self.btn_ai_input = QPushButton("Select Image to Edit"); self.btn_ai_input.clicked.connect(self.select_ai_input)
+        ig_layout.addWidget(self.btn_ai_input)
+        input_group.setLayout(ig_layout)
+        layout.addWidget(input_group)
 
-    # --- File Handlers ---
-    def select_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg)")
-        if path:
-            self.image_path = path
-            self.lbl_image.setText(os.path.basename(path))
+        splitter = QSplitter(Qt.Horizontal)
+        self.lbl_ai_preview_before = QLabel("Before"); self.lbl_ai_preview_before.setAlignment(Qt.AlignCenter); self.lbl_ai_preview_before.setStyleSheet("border: 2px dashed #444; background: #222;"); self.lbl_ai_preview_before.setMinimumSize(300, 300)
+        self.lbl_ai_preview_after = QLabel("After Result"); self.lbl_ai_preview_after.setAlignment(Qt.AlignCenter); self.lbl_ai_preview_after.setStyleSheet("border: 2px solid #0078d4; background: #222;"); self.lbl_ai_preview_after.setMinimumSize(300, 300)
+        splitter.addWidget(self.lbl_ai_preview_before); splitter.addWidget(self.lbl_ai_preview_after)
+        layout.addWidget(splitter)
 
-    def select_audio(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Audio", "", "Audio (*.mp3)")
-        if path:
-            self.audio_path = path
-            self.lbl_audio.setText(os.path.basename(path))
+        prompt_group = QGroupBox("2. Describe the edit")
+        pg_layout = QVBoxLayout()
+        self.txt_prompt = QLineEdit(); self.txt_prompt.setPlaceholderText("e.g., 'make the jacket red', 'remove the person'")
+        self.txt_prompt.setFixedHeight(40); self.txt_prompt.setStyleSheet("font-size: 14px; padding: 5px;")
+        pg_layout.addWidget(self.txt_prompt)
+        prompt_group.setLayout(pg_layout)
+        layout.addWidget(prompt_group)
 
-    def select_video_input(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video (*.mp4)")
-        if path:
-            self.video_input_path = path
-            self.lbl_video.setText(os.path.basename(path))
+        self.btn_run_ai = QPushButton("✨ Apply Magic Edit ✨"); self.btn_run_ai.setFixedHeight(50); self.btn_run_ai.setStyleSheet("background-color: #6a00ff; font-size: 16px;"); self.btn_run_ai.clicked.connect(self.run_ai_edit)
+        layout.addWidget(self.btn_run_ai)
+
+    def switch_image_mode(self, index): self.stack_img.setCurrentIndex(index)
+
+    # --- HANDLERS ---
+    def select_image(self): self._select_file(self.lbl_image, "image_path", "Images (*.png *.jpg)")
+    def select_audio(self): self._select_file(self.lbl_audio, "audio_path", "Audio (*.mp3)")
+    def select_video_input(self): self._select_file(self.lbl_video, "video_input_path", "Video (*.mp4)")
+    def _select_file(self, label, var_name, filter_str):
+        path, _ = QFileDialog.getOpenFileName(self, "Select File", "", filter_str)
+        if path: setattr(self, var_name, path); label.setText(os.path.basename(path))
 
     def select_batch_images(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Select Images", "", "Images (*.png *.jpg)")
-        if paths:
-            self.img_batch_paths = paths
-            self.lbl_batch.setText(f"{len(paths)} images selected")
+        if paths: self.img_batch_paths = paths; self.lbl_batch.setText(f"{len(paths)} files")
 
     def select_concat_img(self, num):
         path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg)")
         if path:
-            if num == 1:
-                self.concat_img1 = path
-                self.lbl_c1.setText(f"Left: {os.path.basename(path)}")
-            else:
-                self.concat_img2 = path
-                self.lbl_c2.setText(f"Right: {os.path.basename(path)}")
+            if num == 1: self.concat_img1 = path; self.lbl_c1.setText(os.path.basename(path))
+            else: self.concat_img2 = path; self.lbl_c2.setText(os.path.basename(path))
 
-    # --- Runners ---
-    def run_create_video(self):
-        if not self.image_path or not self.audio_path:
-            QMessageBox.warning(self, "Error", "Missing files")
-            return
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Video", "output.mp4", "Video (*.mp4)")
+    def select_ai_input(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg *.jpeg)")
+        if path:
+            self.ai_input_path = path
+            self.btn_ai_input.setText(os.path.basename(path))
+            pixmap = QPixmap(path).scaled(self.lbl_ai_preview_before.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.lbl_ai_preview_before.setPixmap(pixmap)
+
+    # --- RUNNERS ---
+    def run_create_video(self): self.start_worker('create_video', img=self.image_path, audio=self.audio_path, output=self._save("Video (*.mp4)"), quality=self.combo_quality_video.currentText())
+    def run_upscale_video(self): self.start_worker('upscale_video', video=self.video_input_path, output=self._save("Video (*.mp4)"), quality=self.combo_quality_upscale.currentText())
+    def run_concat_images(self): self.start_worker('concat_images', img1=self.concat_img1, img2=self.concat_img2, output=self._save("Image (*.png)"))
+    def run_upscale_images(self): 
+        folder = QFileDialog.getExistingDirectory(self, "Output Folder")
+        if folder: self.start_worker('upscale_images', images=self.img_batch_paths, output_folder=folder, quality=self.combo_quality_img.currentText())
+
+    def run_ai_edit(self):
+        if not self.ai_input_path or not self.txt_prompt.text():
+            QMessageBox.warning(self, "Error", "Missing Image or Prompt"); return
+        save_path = self._save("Image (*.png)")
         if save_path:
-            self.start_worker('create_video', img=self.image_path, audio=self.audio_path, output=save_path, quality=self.combo_quality_video.currentText())
+            self.ai_output_path = save_path
+            self.start_worker('ai_edit', img=self.ai_input_path, prompt=self.txt_prompt.text(), output=save_path)
 
-    def run_upscale_video(self):
-        if not self.video_input_path:
-            QMessageBox.warning(self, "Error", "Missing video")
-            return
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Video", "upscaled.mp4", "Video (*.mp4)")
-        if save_path:
-            self.start_worker('upscale_video', video=self.video_input_path, output=save_path, quality=self.combo_quality_upscale.currentText())
-
-    def run_upscale_images(self):
-        if not self.img_batch_paths:
-            QMessageBox.warning(self, "Error", "No images selected")
-            return
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
-        if folder:
-            self.start_worker('upscale_images', images=self.img_batch_paths, output_folder=folder, quality=self.combo_quality_img.currentText())
-
-    def run_concat_images(self):
-        if not self.concat_img1 or not self.concat_img2:
-            QMessageBox.warning(self, "Error", "Select both images")
-            return
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Image", "merged.png", "Image (*.png)")
-        if save_path:
-            self.start_worker('concat_images', img1=self.concat_img1, img2=self.concat_img2, output=save_path)
+    def _save(self, filter_str):
+        path, _ = QFileDialog.getSaveFileName(self, "Save File", "", filter_str)
+        return path
 
     def start_worker(self, mode, **kwargs):
-        self.progress.setRange(0, 0)
-        self.worker = WorkerThread(mode, self.generator, **kwargs)
+        if mode != 'upscale_images' and not kwargs.get('output'): return 
+        self.set_ui_busy(True)
+        self.log_console.clear()
+        self.worker = WorkerThread(mode, **kwargs)
         self.worker.finished.connect(self.on_finished)
+        self.worker.progress_update.connect(self.update_progress)
+        self.worker.log_update.connect(self.append_log)
         self.worker.start()
 
+    def update_progress(self, val): self.progress.setValue(val)
+    def append_log(self, text): self.log_console.append(text)
+    
+    def set_ui_busy(self, busy):
+        self.tabs.setDisabled(busy)
+        self.btn_run_ai.setDisabled(busy)
+
     def on_finished(self, success, message):
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100 if success else 0)
+        self.set_ui_busy(False)
         if success:
+            self.progress.setValue(100)
+            self.append_log("✅ DONE.")
+            if self.tabs.currentIndex() == 3 and hasattr(self, 'ai_output_path') and os.path.exists(self.ai_output_path):
+                 pixmap = QPixmap(self.ai_output_path).scaled(self.lbl_ai_preview_after.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                 self.lbl_ai_preview_after.setPixmap(pixmap)
             QMessageBox.information(self, "Success", message)
         else:
+            self.append_log(f"❌ ERROR: {message}")
             QMessageBox.critical(self, "Error", message)
