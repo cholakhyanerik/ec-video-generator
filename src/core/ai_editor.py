@@ -1,71 +1,114 @@
 import os
 import torch
 from PIL import Image, ImageOps
-from diffusers import StableDiffusionInstructPix2PixPipeline, EulerAncestralDiscreteScheduler
+from diffusers import (
+    StableDiffusionInstructPix2PixPipeline, 
+    EulerAncestralDiscreteScheduler,
+    StableVideoDiffusionPipeline
+)
+from diffusers.utils import export_to_video
 
 class AIImageEditor:
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
-            print("Initializing AI Engine... (This will take time on first run)")
+            print("Initializing AI Engine Wrapper...")
             cls._instance = super(AIImageEditor, cls).__new__(cls)
-            cls._instance._load_model()
+            cls._instance.device = "cuda" if torch.cuda.is_available() else "cpu"
+            cls._instance.edit_pipe = None
+            cls._instance.video_pipe = None
         return cls._instance
 
-    def _load_model(self):
-        model_id = "timbrooks/instruct-pix2pix"
-        
-        if torch.cuda.is_available():
-            self.device = "cuda"
-            dtype = torch.float16
-        else:
-            self.device = "cpu"
-            dtype = torch.float32
+    def _load_edit_model(self):
+        """ Loads InstructPix2Pix (Image Editing) """
+        if self.edit_pipe is not None: return
 
-        # Load the pipeline
-        self.pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-            model_id, 
+        print("Loading Edit Model (InstructPix2Pix)...")
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        
+        self.edit_pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+            "timbrooks/instruct-pix2pix", 
             torch_dtype=dtype, 
             safety_checker=None
         )
-        self.pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.pipe.scheduler.config)
-        self.pipe.to(self.device)
+        self.edit_pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(self.edit_pipe.scheduler.config)
         
         if self.device == "cuda":
-            self.pipe.enable_attention_slicing()
+            self.edit_pipe.enable_model_cpu_offload()
 
-    def edit_image(self, image_path, prompt, output_path, steps=20, guidance_scale=7.5, image_guidance_scale=1.5, status_callback=None):
+    def _load_video_model(self):
+        """ Loads SVD (Image to Video) from an OPEN MIRROR """
+        if self.video_pipe is not None: return
+
+        print("Loading Video Model (SVD Open Mirror)...")
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        
+        model_id = "vdo/stable-video-diffusion-img2vid-xt-1-1" 
+        
+        try:
+            self.video_pipe = StableVideoDiffusionPipeline.from_pretrained(
+                model_id, 
+                torch_dtype=dtype, 
+                variant="fp16"
+            )
+        except Exception as e:
+            print(f"Mirror download failed, trying fallback... Error: {e}")
+            self.video_pipe = StableVideoDiffusionPipeline.from_pretrained(
+                "mkshing/svd-xt", 
+                torch_dtype=dtype, 
+                variant="fp16"
+            )
+        
+        if self.device == "cuda":
+            self.video_pipe.enable_model_cpu_offload() 
+            self.video_pipe.unet.enable_forward_chunking()
+
+    def edit_image(self, image_path, prompt, output_path, steps=20, image_guidance_scale=1.5, status_callback=None):
+        """ 
+        Runs the Image Edit.
+        - image_guidance_scale: 1.0 (Creative) to 3.0 (Strict Fidelity). Default 1.5.
         """
-        Runs the edit with progress reporting.
-        status_callback: function(step, total_steps)
-        """
-        if not self.pipe:
-             raise Exception("AI Model not initialized.")
+        self._load_edit_model()
              
         input_image = Image.open(image_path)
-        input_image = ImageOps.exif_transpose(input_image)
-        input_image = input_image.convert("RGB")
-
-        # Resize safety for VRAM
+        input_image = ImageOps.exif_transpose(input_image).convert("RGB")
+        
         max_dim = 768
         if max(input_image.size) > max_dim:
              input_image.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
 
-        # Callback wrapper
         def pipe_callback(step, timestep, latents):
-            if status_callback:
-                status_callback(step, steps)
+            if status_callback: status_callback(step, steps)
 
         with torch.autocast(self.device):
-            images = self.pipe(
-                prompt, 
-                image=input_image, 
-                num_inference_steps=steps, 
-                guidance_scale=guidance_scale,
-                image_guidance_scale=image_guidance_scale,
-                callback=pipe_callback,
-                callback_steps=1 
-            ).images
+            res = self.edit_pipe(
+                prompt, image=input_image, num_inference_steps=steps, 
+                guidance_scale=7.5, 
+                image_guidance_scale=image_guidance_scale, # Controlled by slider
+                callback=pipe_callback, callback_steps=1 
+            ).images[0]
 
-        images[0].save(output_path, quality=95)
+        res.save(output_path)
+
+    def animate_image(self, image_path, output_path, steps=25, status_callback=None):
+        self._load_video_model()
+
+        input_image = Image.open(image_path).convert("RGB")
+        input_image = ImageOps.exif_transpose(input_image)
+        input_image = input_image.resize((1024, 576), Image.Resampling.LANCZOS)
+
+        def pipe_callback(pipe, step, timestep, callback_kwargs):
+            if status_callback: status_callback(step, steps)
+            return callback_kwargs
+
+        frames = self.video_pipe(
+            input_image, 
+            decode_chunk_size=2, 
+            num_inference_steps=steps,
+            motion_bucket_id=127, 
+            generator=torch.manual_seed(42),
+            callback_on_step_end=pipe_callback 
+        ).frames[0]
+
+        export_to_video(frames, output_path, fps=7)

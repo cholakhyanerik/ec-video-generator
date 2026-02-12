@@ -1,10 +1,14 @@
 import sys
 import os
 import shutil
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                               QHBoxLayout, QLabel, QPushButton, QFileDialog, 
-                               QComboBox, QProgressBar, QMessageBox, QGroupBox, 
-                               QTabWidget, QStackedWidget, QLineEdit, QTextEdit, QSplitter)
+import time
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QLabel, QPushButton, QFileDialog, QComboBox, QProgressBar, 
+    QMessageBox, QGroupBox, QTabWidget, QStackedWidget, QLineEdit, 
+    QTextEdit, QSplitter, QSlider
+)
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QIcon, QPixmap
 
@@ -42,9 +46,12 @@ class WorkerThread(QThread):
         try:
             self.log_update.emit(f"--- Starting Task: {self.mode} ---")
             
+            # --- AI MODES ---
             if self.mode == 'ai_edit':
                 self.run_ai_edit()
+            # ai_animate stashed
             
+            # --- VIDEO/IMAGE MODES ---
             elif self.mode == 'create_video':
                 self.log_update.emit("Generating video from image + audio...")
                 self.progress_update.emit(10) 
@@ -81,53 +88,42 @@ class WorkerThread(QThread):
             self.log_update.emit(f"ERROR: {str(e)}")
             self.finished.emit(False, f"Error: {e}")
 
-    def run_ai_edit(self):
-        input_path = self.kwargs['img'] 
-        output_path = self.kwargs['output']
-        prompt = self.kwargs['prompt']
-        
-        # Check if input is video or image
-        is_video = input_path.lower().endswith(('.mp4', '.avi', '.mov'))
-        
+    def _load_ai_engine(self):
         self.log_update.emit("Initializing AI Engine... (Check terminal if downloading models)")
         global AIImageEditor
         if AIImageEditor is None:
                 from ..core.ai_editor import AIImageEditor as AIEngine
                 AIImageEditor = AIEngine
+        return AIImageEditor()
+
+    def run_ai_edit(self):
+        input_path = self.kwargs['img'] 
+        output_path = self.kwargs['output']
+        prompt = self.kwargs['prompt']
+        # Read the slider value (default 1.5)
+        img_scale = self.kwargs.get('image_guidance_scale', 1.5)
         
-        ai_engine = AIImageEditor()
+        is_video = input_path.lower().endswith(('.mp4', '.avi', '.mov'))
+        ai_engine = self._load_ai_engine()
         self.log_update.emit("AI Model Loaded.")
 
         if is_video:
             # VIDEO MODE
             temp_dir = os.path.join(os.path.dirname(output_path), "temp_frames_ai")
-            
-            # 1. Extract Frames
             self.log_update.emit("Extracting video frames...")
             frames = self.generator.extract_frames(input_path, temp_dir)
             total_frames = len(frames)
+            self.log_update.emit(f"Processing {total_frames} frames...")
             
-            self.log_update.emit(f"Processing {total_frames} frames. This will take time!")
-            
-            # 2. Process Each Frame
             for i, frame_path in enumerate(frames):
                 self.log_update.emit(f"AI Edit: Frame {i+1}/{total_frames}")
-                
-                # We overwrite the frame with the edited version
-                # Reduced steps to 10 for video speed, guidance 7.5
-                ai_engine.edit_image(frame_path, prompt, frame_path, steps=10)
-                
-                # Update progress
+                ai_engine.edit_image(frame_path, prompt, frame_path, steps=10, image_guidance_scale=img_scale)
                 progress = int(((i + 1) / total_frames) * 100)
                 self.progress_update.emit(progress)
             
-            # 3. Stitch back
             self.log_update.emit("Reassembling video...")
             self.generator.frames_to_video(temp_dir, input_path, output_path)
-            
-            # 4. Cleanup
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
             
         else:
             # IMAGE MODE
@@ -136,14 +132,14 @@ class WorkerThread(QThread):
                 self.progress_update.emit(progress)
                 self.log_update.emit(f"AI Processing: Step {step + 1}/{total_steps}")
 
-            ai_engine.edit_image(input_path, prompt, output_path, status_callback=callback)
+            ai_engine.edit_image(input_path, prompt, output_path, image_guidance_scale=img_scale, status_callback=callback)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EC Video Generator Studio")
-        self.resize(900, 750) 
+        self.resize(1000, 800) 
         
         icon_path = resource_path(os.path.join("assets", "icon.png"))
         if os.path.exists(icon_path):
@@ -157,6 +153,7 @@ class MainWindow(QMainWindow):
         self.concat_img1 = None
         self.concat_img2 = None
         self.ai_input_path = None
+        self.ai_output_path = None
 
         self.setup_ui()
         self.setStyleSheet(DARK_THEME)
@@ -201,7 +198,7 @@ class MainWindow(QMainWindow):
         progress_group.setLayout(pg_layout)
         main_layout.addWidget(progress_group)
 
-    # --- TAB SETUP FUNCTIONS ---
+    # --- TAB 1: CREATE VIDEO ---
     def setup_create_tab(self):
         layout = QVBoxLayout(self.tab_create)
         self.lbl_image = QLabel("No Image Selected")
@@ -216,6 +213,7 @@ class MainWindow(QMainWindow):
         btn_run = QPushButton("Generate Video"); btn_run.setFixedHeight(40); btn_run.clicked.connect(self.run_create_video)
         layout.addWidget(btn_run); layout.addStretch()
 
+    # --- TAB 2: UPSCALE VIDEO ---
     def setup_upscale_tab(self):
         layout = QVBoxLayout(self.tab_upscale)
         self.lbl_video = QLabel("No Video Selected")
@@ -227,6 +225,7 @@ class MainWindow(QMainWindow):
         btn_run = QPushButton("Upscale Video"); btn_run.setFixedHeight(40); btn_run.clicked.connect(self.run_upscale_video)
         layout.addWidget(btn_run); layout.addStretch()
 
+    # --- TAB 3: IMAGE TOOLS ---
     def setup_image_tools_tab(self):
         layout = QVBoxLayout(self.tab_images)
         layout.addWidget(QLabel("Select Tool:"))
@@ -256,30 +255,62 @@ class MainWindow(QMainWindow):
         self.stack_img.addWidget(p1); self.stack_img.addWidget(p2)
         layout.addWidget(self.stack_img)
 
+    # --- TAB 4: AI EDITOR ---
     def setup_ai_tab(self):
         layout = QVBoxLayout(self.tab_ai)
-        input_group = QGroupBox("1. Select Image or Video")
+
+        # 1. Input
+        input_group = QGroupBox("1. Select Input Image or Video")
         ig_layout = QHBoxLayout()
         self.btn_ai_input = QPushButton("Select Image/Video to Edit"); self.btn_ai_input.clicked.connect(self.select_ai_input)
         ig_layout.addWidget(self.btn_ai_input)
         input_group.setLayout(ig_layout)
         layout.addWidget(input_group)
 
+        # 2. Preview
         splitter = QSplitter(Qt.Horizontal)
         self.lbl_ai_preview_before = QLabel("Before"); self.lbl_ai_preview_before.setAlignment(Qt.AlignCenter); self.lbl_ai_preview_before.setStyleSheet("border: 2px dashed #444; background: #222;"); self.lbl_ai_preview_before.setMinimumSize(300, 300)
-        self.lbl_ai_preview_after = QLabel("After Result"); self.lbl_ai_preview_after.setAlignment(Qt.AlignCenter); self.lbl_ai_preview_after.setStyleSheet("border: 2px solid #0078d4; background: #222;"); self.lbl_ai_preview_after.setMinimumSize(300, 300)
+        self.lbl_ai_preview_after = QLabel("After"); self.lbl_ai_preview_after.setAlignment(Qt.AlignCenter); self.lbl_ai_preview_after.setStyleSheet("border: 2px solid #0078d4; background: #222;"); self.lbl_ai_preview_after.setMinimumSize(300, 300)
         splitter.addWidget(self.lbl_ai_preview_before); splitter.addWidget(self.lbl_ai_preview_after)
         layout.addWidget(splitter)
 
-        prompt_group = QGroupBox("2. Describe the edit")
-        pg_layout = QVBoxLayout()
-        self.txt_prompt = QLineEdit(); self.txt_prompt.setPlaceholderText("e.g., 'make the jacket red', 'make it look like a cartoon'")
-        self.txt_prompt.setFixedHeight(40); self.txt_prompt.setStyleSheet("font-size: 14px; padding: 5px;")
-        pg_layout.addWidget(self.txt_prompt)
-        prompt_group.setLayout(pg_layout)
-        layout.addWidget(prompt_group)
+        # 3. Controls (Prompt + Slider)
+        control_group = QGroupBox("2. Settings")
+        cg_layout = QVBoxLayout()
+        
+        # Prompt
+        self.txt_prompt = QLineEdit()
+        self.txt_prompt.setPlaceholderText("e.g., 'make the jacket red'")
+        cg_layout.addWidget(QLabel("Instruction:"))
+        cg_layout.addWidget(self.txt_prompt)
+        
+        # Slider
+        slider_layout = QHBoxLayout()
+        slider_layout.addWidget(QLabel("Creative"))
+        self.slider_fidelity = QSlider(Qt.Horizontal)
+        self.slider_fidelity.setRange(10, 30) # 1.0 to 3.0
+        self.slider_fidelity.setValue(15)     # Default 1.5
+        self.slider_fidelity.setTickPosition(QSlider.TicksBelow)
+        self.slider_fidelity.setTickInterval(5)
+        slider_layout.addWidget(self.slider_fidelity)
+        slider_layout.addWidget(QLabel("Strict"))
+        
+        # Value Label
+        self.lbl_fidelity_val = QLabel("1.5")
+        self.lbl_fidelity_val.setFixedWidth(30)
+        self.lbl_fidelity_val.setStyleSheet("font-weight: bold; color: #00ff00;")
+        self.slider_fidelity.valueChanged.connect(lambda v: self.lbl_fidelity_val.setText(str(v/10.0)))
+        slider_layout.addWidget(self.lbl_fidelity_val)
+        
+        cg_layout.addLayout(slider_layout)
+        control_group.setLayout(cg_layout)
+        layout.addWidget(control_group)
 
-        self.btn_run_ai = QPushButton("✨ Apply Magic Edit ✨"); self.btn_run_ai.setFixedHeight(50); self.btn_run_ai.setStyleSheet("background-color: #6a00ff; font-size: 16px;"); self.btn_run_ai.clicked.connect(self.run_ai_edit)
+        # 4. Run Button
+        self.btn_run_ai = QPushButton("✨ Apply Magic Edit ✨")
+        self.btn_run_ai.setFixedHeight(50)
+        self.btn_run_ai.setStyleSheet("background-color: #6a00ff; font-size: 16px;")
+        self.btn_run_ai.clicked.connect(self.run_ai_edit)
         layout.addWidget(self.btn_run_ai)
 
     def switch_image_mode(self, index): self.stack_img.setCurrentIndex(index)
@@ -326,14 +357,20 @@ class MainWindow(QMainWindow):
         if not self.ai_input_path or not self.txt_prompt.text():
             QMessageBox.warning(self, "Error", "Missing Input or Prompt"); return
         
+        # Get Slider Value
+        fidelity = self.slider_fidelity.value() / 10.0
+        
         is_video = self.ai_input_path.lower().endswith(('.mp4', '.avi'))
         filter_str = "Video (*.mp4)" if is_video else "Image (*.png)"
-        default_name = "ai_result.mp4" if is_video else "ai_result.png"
+        save_path = self._save(filter_str)
         
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Result", default_name, filter_str)
         if save_path:
             self.ai_output_path = save_path
-            self.start_worker('ai_edit', img=self.ai_input_path, prompt=self.txt_prompt.text(), output=save_path)
+            self.start_worker('ai_edit', 
+                              img=self.ai_input_path, 
+                              prompt=self.txt_prompt.text(), 
+                              output=save_path,
+                              image_guidance_scale=fidelity) # Pass the slider value
 
     def _save(self, filter_str):
         path, _ = QFileDialog.getSaveFileName(self, "Save File", "", filter_str)
